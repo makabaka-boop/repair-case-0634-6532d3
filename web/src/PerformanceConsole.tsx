@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   ApiError,
   loadPerformance,
@@ -48,6 +48,13 @@ export default function PerformanceConsole() {
   const [name, setName] = useState('');
   const [loadId, setLoadId] = useState('');
   const [cueText, setCueText] = useState('');
+  // Monotonic ticket of the latest issued operation. Every async operation
+  // (create / load / transition / registerCue) takes a ticket when it is
+  // issued; a response is applied only while its ticket is still the newest,
+  // so a late response from a superseded context (e.g. a cue commit for
+  // session A landing after session B was loaded, or a stale load landing
+  // after a newer commit) can never overwrite the current snapshot.
+  const opTicket = useRef(0);
 
   // Errors keep the current session on screen; only the error banner changes.
   function reportError(err: unknown) {
@@ -61,13 +68,15 @@ export default function PerformanceConsole() {
   }
 
   async function run(action: () => Promise<Performance>) {
+    const ticket = ++opTicket.current;
     setCommandBusy(true);
     setError(null);
     try {
-      setSession(await action());
+      const next = await action();
+      if (ticket === opTicket.current) setSession(next);
     } catch (err) {
-      setSession(null);
-      reportError(err);
+      // Errors keep the current session on screen; only the banner changes.
+      if (ticket === opTicket.current) reportError(err);
     } finally {
       setCommandBusy(false);
     }
@@ -93,13 +102,16 @@ export default function PerformanceConsole() {
       setError({ code: 'INVALID_BODY', message: '请输入要载入的场次 ID。' });
       return;
     }
+    const ticket = ++opTicket.current;
     setLoadBusy(true);
     setError(null);
     loadPerformance(id)
-      .then(setSession)
+      .then((next) => {
+        if (ticket === opTicket.current) setSession(next);
+      })
       .catch((err) => {
-        setSession(null);
-        reportError(err);
+        // A missing id must not wipe the session already on screen.
+        if (ticket === opTicket.current) reportError(err);
       })
       .finally(() => setLoadBusy(false));
   }

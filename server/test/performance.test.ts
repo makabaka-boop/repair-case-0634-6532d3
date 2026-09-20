@@ -93,6 +93,34 @@ describe('performance console — lifecycle', () => {
     expect(res.json().performance).toMatchObject({ status: 'ended', version: 5 });
   });
 
+  it('seals a paused session directly (paused -> ended)', async () => {
+    const s = await createSession('暂停后封存', 'req-pe-1');
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-pe-2',
+    });
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'paused',
+      expectedVersion: 2,
+      requestId: 'req-pe-3',
+    });
+
+    const res = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'ended',
+      expectedVersion: 3,
+      requestId: 'req-pe-4',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().performance).toMatchObject({ status: 'ended', version: 4 });
+  });
+
   it('registers int32 cues in order only while running', async () => {
     const s = await createSession('cue 登记', 'req-cue-1');
     await sendCommand({
@@ -296,6 +324,127 @@ describe('performance console — rejections leave state untouched', () => {
     });
     expect(missingCmd.statusCode).toBe(404);
     expect(missingCmd.json().error.code).toBe('SESSION_NOT_FOUND');
+  });
+});
+
+describe('performance console — retry after rejection reuses the request id', () => {
+  it('a VERSION_CONFLICT rejection does not consume the request id', async () => {
+    const s = await createSession('版本冲突重试', 'req-rc-1');
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-rc-2',
+    });
+
+    const stale = await sendCommand({
+      command: 'registerCue',
+      performanceId: s.id,
+      cue: 55,
+      expectedVersion: 1, // current version is 2
+      requestId: 'req-rc-3',
+    });
+    expect(stale.statusCode).toBe(409);
+    expectRejected(stale.json(), 'VERSION_CONFLICT');
+
+    // Corrected retry with the same request id must go through.
+    const retry = await sendCommand({
+      command: 'registerCue',
+      performanceId: s.id,
+      cue: 55,
+      expectedVersion: 2,
+      requestId: 'req-rc-3',
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().performance).toMatchObject({ version: 3, cues: [55] });
+  });
+
+  it('an ILLEGAL_TRANSITION rejection does not consume the request id', async () => {
+    const s = await createSession('非法迁移重试', 'req-ri-1');
+    const illegal = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'ended',
+      expectedVersion: 1,
+      requestId: 'req-ri-2',
+    });
+    expect(illegal.statusCode).toBe(409);
+    expectRejected(illegal.json(), 'ILLEGAL_TRANSITION');
+
+    const retry = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-ri-2',
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().performance).toMatchObject({ status: 'running', version: 2 });
+  });
+
+  it('a NOT_RUNNING rejection does not consume the request id', async () => {
+    const s = await createSession('非运行重试', 'req-rn-1');
+    const rejected = await sendCommand({
+      command: 'registerCue',
+      performanceId: s.id,
+      cue: 88,
+      expectedVersion: 1,
+      requestId: 'req-rn-2',
+    });
+    expect(rejected.statusCode).toBe(409);
+    expectRejected(rejected.json(), 'NOT_RUNNING');
+
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-rn-3',
+    });
+    const retry = await sendCommand({
+      command: 'registerCue',
+      performanceId: s.id,
+      cue: 88,
+      expectedVersion: 2,
+      requestId: 'req-rn-2',
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().performance.cues).toEqual([88]);
+  });
+
+  it('once the corrected retry commits, the request id is spent', async () => {
+    const s = await createSession('重试后去重', 'req-rd-1');
+    const illegal = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'ended',
+      expectedVersion: 1,
+      requestId: 'req-rd-2',
+    });
+    expect(illegal.statusCode).toBe(409);
+
+    const retry = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-rd-2',
+    });
+    expect(retry.statusCode).toBe(200);
+
+    const replay = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-rd-2',
+    });
+    expect(replay.statusCode).toBe(409);
+    expectRejected(replay.json(), 'DUPLICATE_REQUEST');
+
+    const loaded = (await getPerformance(s.id)).json().performance;
+    expect(loaded).toMatchObject({ status: 'running', version: 2 });
   });
 });
 

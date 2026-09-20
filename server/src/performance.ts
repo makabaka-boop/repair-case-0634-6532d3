@@ -67,7 +67,7 @@ export type RejectReason =
 const LEGAL_TRANSITIONS: Record<PerformanceStatus, readonly PerformanceStatus[]> = {
   pending: ['running'],
   running: ['paused', 'ended'],
-  paused: ['running'],
+  paused: ['running', 'ended'],
   ended: [],
 };
 
@@ -167,8 +167,6 @@ export class PerformanceStore {
         `Request id "${command.requestId}" was already committed to session "${session.id}".`,
       );
     }
-
-    this.committedRequests.set(command.requestId, session.id);
 
     if (command.expectedVersion !== session.version) {
       reject(
