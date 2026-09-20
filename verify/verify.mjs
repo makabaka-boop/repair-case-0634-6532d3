@@ -461,6 +461,110 @@ let perfId;
   );
 }
 
+// Rejections must not consume the request id, and paused sessions can be
+// sealed straight to ended without a resume.
+{
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '失败更正重试',
+    requestId: commandRequestId('fix-create'),
+  });
+  const id = create.body.performance.id;
+
+  const replayEnvelope = {
+    command: 'transition',
+    performanceId: id,
+    status: 'running',
+    expectedVersion: 1,
+    requestId: commandRequestId('fix-replay'),
+  };
+
+  // Wrong target status first (pending -> ended): rejected, no side effect.
+  replayEnvelope.status = 'ended';
+  const illegal = await sendCommand(WEB_URL, replayEnvelope);
+  check(
+    'first attempt rejected as ILLEGAL_TRANSITION',
+    illegal.status === 409 && illegal.body?.error?.reason === 'ILLEGAL_TRANSITION',
+    `got ${illegal.status} ${JSON.stringify(illegal.body)}`,
+  );
+
+  // Correct the condition while reusing the same request id: must commit.
+  replayEnvelope.status = 'running';
+  const retried = await sendCommand(WEB_URL, replayEnvelope);
+  check(
+    'same requestId commits after correction -> v2 running',
+    retried.status === 200 &&
+      retried.body?.performance?.version === 2 &&
+      retried.body?.performance?.status === 'running',
+    `got ${retried.status} ${JSON.stringify(retried.body)}`,
+  );
+
+  // Pause, then seal directly from paused (no resume required).
+  const pause = await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id,
+    status: 'paused',
+    expectedVersion: 2,
+    requestId: commandRequestId('fix-pause'),
+  });
+  check('fix session paused v3', pause.status === 200 &&
+    pause.body?.performance?.status === 'paused',
+    `got ${pause.status}`);
+
+  const sealed = await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id,
+    status: 'ended',
+    expectedVersion: 3,
+    requestId: commandRequestId('fix-end'),
+  });
+  check(
+    'paused -> ended directly -> v4 ended',
+    sealed.status === 200 &&
+      sealed.body?.performance?.status === 'ended' &&
+      sealed.body?.performance?.version === 4,
+    `got ${sealed.status} ${JSON.stringify(sealed.body)}`,
+  );
+
+  // Stale-version rejection followed by same-id corrected retry on a fresh
+  // session: VERSION_CONFLICT must not poison the request id either.
+  const c2 = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '版本冲突重试',
+    requestId: commandRequestId('fix2-create'),
+  });
+  const id2 = c2.body.performance.id;
+  const cueEnvelope = {
+    command: 'registerCue',
+    performanceId: id2,
+    cue: 808,
+    expectedVersion: 1,
+    requestId: commandRequestId('fix2-replay'),
+  };
+  const stale = await sendCommand(WEB_URL, cueEnvelope);
+  check(
+    'cue at pending v1 rejected as NOT_RUNNING',
+    stale.status === 409 && stale.body?.error?.reason === 'NOT_RUNNING',
+    `got ${stale.status}`,
+  );
+  await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id2,
+    status: 'running',
+    expectedVersion: 1,
+    requestId: commandRequestId('fix2-start'),
+  });
+  cueEnvelope.expectedVersion = 2;
+  const cueOk = await sendCommand(WEB_URL, cueEnvelope);
+  check(
+    'same cue requestId commits after start -> v3',
+    cueOk.status === 200 &&
+      cueOk.body?.performance?.version === 3 &&
+      JSON.stringify(cueOk.body?.performance?.cues) === '[808]',
+    `got ${cueOk.status} ${JSON.stringify(cueOk.body)}`,
+  );
+}
+
 // Same-version concurrency against the API directly: exactly one commit.
 {
   const create = await sendCommand(API_URL, {

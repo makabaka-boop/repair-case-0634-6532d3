@@ -231,6 +231,124 @@ describe('performance console — rejections leave state untouched', () => {
     expect(loaded.cues).toEqual([]);
   });
 
+  it('allows paused -> ended directly without resuming', async () => {
+    const s = await createSession('暂停后封存', 'req-pe-1');
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-pe-2',
+    });
+    const paused = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'paused',
+      expectedVersion: 2,
+      requestId: 'req-pe-3',
+    });
+    expect(paused.statusCode).toBe(200);
+    expect(paused.json().performance.status).toBe('paused');
+
+    const ended = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'ended',
+      expectedVersion: 3,
+      requestId: 'req-pe-4',
+    });
+    expect(ended.statusCode).toBe(200);
+    expect(ended.json().performance).toMatchObject({ status: 'ended', version: 4 });
+  });
+
+  it('lets a rejected request id be replayed after the precondition is corrected', async () => {
+    const s = await createSession('失败后重试', 'req-rt-1');
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: 'req-rt-2',
+    });
+
+    // Same envelope, same request id: first rejected for a stale version,
+    // then for NOT_RUNNING after pausing; the id must remain reusable.
+    const envelope = {
+      command: 'registerCue' as const,
+      performanceId: s.id,
+      cue: 512,
+      expectedVersion: 1,
+      requestId: 'req-rt-replay',
+    };
+    const stale = await sendCommand(envelope);
+    expect(stale.statusCode).toBe(409);
+    expectRejected(stale.json(), 'VERSION_CONFLICT');
+
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'paused',
+      expectedVersion: 2,
+      requestId: 'req-rt-3',
+    });
+    envelope.expectedVersion = 3;
+    const whilePaused = await sendCommand(envelope);
+    expect(whilePaused.statusCode).toBe(409);
+    expectRejected(whilePaused.json(), 'NOT_RUNNING');
+
+    // Correct both conditions, keep the original request id: it must commit.
+    await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 3,
+      requestId: 'req-rt-4',
+    });
+    envelope.expectedVersion = 4;
+    const retried = await sendCommand(envelope);
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json().performance).toMatchObject({
+      status: 'running',
+      version: 5,
+      requestId: 'req-rt-replay',
+      cues: [512],
+    });
+
+    // After commit the id is spent: replay is now a true duplicate.
+    const again = await sendCommand(envelope);
+    expect(again.statusCode).toBe(409);
+    expectRejected(again.json(), 'DUPLICATE_REQUEST');
+  });
+
+  it('lets an illegal-transition request id be replayed as a legal transition', async () => {
+    const s = await createSession('非法迁移后重试', 'req-ir-1');
+    const replayId = 'req-ir-replay';
+    const illegal = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'ended',
+      expectedVersion: 1,
+      requestId: replayId,
+    });
+    expect(illegal.statusCode).toBe(409);
+    expectRejected(illegal.json(), 'ILLEGAL_TRANSITION');
+
+    // pending -> ended stays illegal, but the same id works for running.
+    const ok = await sendCommand({
+      command: 'transition',
+      performanceId: s.id,
+      status: 'running',
+      expectedVersion: 1,
+      requestId: replayId,
+    });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().performance).toMatchObject({
+      status: 'running',
+      version: 2,
+      requestId: replayId,
+    });
+  });
+
   it('rejects duplicate request ids for create and follow-up commands without side effects', async () => {
     const first = await sendCommand({
       command: 'create',

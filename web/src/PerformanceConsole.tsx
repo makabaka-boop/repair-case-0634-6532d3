@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   ApiError,
   loadPerformance,
@@ -49,33 +49,69 @@ export default function PerformanceConsole() {
   const [loadId, setLoadId] = useState('');
   const [cueText, setCueText] = useState('');
 
-  // Errors keep the current session on screen; only the error banner changes.
-  function reportError(err: unknown) {
+  // Monotonic token of the last user-initiated request. Responses that were
+  // superseded by a later action must never touch the view: otherwise a slow
+  // load of session B could be overwritten by an even slower response for A,
+  // or a stale GET snapshot could roll a freshly committed version backwards.
+  const generationRef = useRef(0);
+  const sessionRef = useRef<Performance | null>(null);
+  const commandInFlightRef = useRef(0);
+  const loadInFlightRef = useRef(0);
+
+  function reportError(err: unknown): ConsoleError {
     if (err instanceof ApiError) {
-      setError({ code: err.code, reason: err.reason, message: err.message });
-    } else if (err instanceof ClientError) {
-      setError({ code: err.code, message: err.message });
-    } else {
-      setError({ code: 'NETWORK', message: '无法连接服务，请确认 API 已启动。' });
+      return { code: err.code, reason: err.reason, message: err.message };
     }
+    if (err instanceof ClientError) {
+      return { code: err.code, message: err.message };
+    }
+    return { code: 'NETWORK', message: '无法连接服务，请确认 API 已启动。' };
   }
 
-  async function run(action: () => Promise<Performance>) {
+  /**
+   * Merge an arriving snapshot with the one on screen. Loads and commands may
+   * be in flight at the same time and may finish in any order. A response
+   * belonging to the latest user action may switch the displayed session, but
+   * a GET must never downgrade a version a command already committed. A
+   * response superseded by a newer action may only catch the same session up
+   * in version — it can never switch sessions or surface a stale error.
+   */
+  function adoptSnapshot(next: Performance, stale: boolean) {
+    const current = sessionRef.current;
+    if (stale) {
+      if (!current || current.id !== next.id || next.version <= current.version) {
+        return;
+      }
+    } else if (current && current.id === next.id && current.version > next.version) {
+      return;
+    }
+    sessionRef.current = next;
+    setSession(next);
+  }
+
+  function runCommand(action: () => Promise<Performance>) {
+    const gen = ++generationRef.current;
+    commandInFlightRef.current += 1;
     setCommandBusy(true);
     setError(null);
-    try {
-      setSession(await action());
-    } catch (err) {
-      setSession(null);
-      reportError(err);
-    } finally {
-      setCommandBusy(false);
-    }
+    void action().then(
+      (snapshot) => {
+        adoptSnapshot(snapshot, generationRef.current !== gen);
+      },
+      (err) => {
+        if (generationRef.current !== gen) return;
+        // A rejected command changes nothing server-side: keep the snapshot.
+        setError(reportError(err));
+      },
+    ).finally(() => {
+      commandInFlightRef.current -= 1;
+      if (commandInFlightRef.current === 0) setCommandBusy(false);
+    });
   }
 
   // The only write entry: build a command envelope from the current snapshot.
   function dispatch(command: Parameters<typeof submitPerformanceCommand>[0]) {
-    return run(() => submitPerformanceCommand(command));
+    runCommand(() => submitPerformanceCommand(command));
   }
 
   function onCreate() {
@@ -93,15 +129,24 @@ export default function PerformanceConsole() {
       setError({ code: 'INVALID_BODY', message: '请输入要载入的场次 ID。' });
       return;
     }
+    const gen = ++generationRef.current;
+    loadInFlightRef.current += 1;
     setLoadBusy(true);
     setError(null);
-    loadPerformance(id)
-      .then(setSession)
-      .catch((err) => {
-        setSession(null);
-        reportError(err);
-      })
-      .finally(() => setLoadBusy(false));
+    void loadPerformance(id).then(
+      (snapshot) => {
+        adoptSnapshot(snapshot, generationRef.current !== gen);
+      },
+      (err) => {
+        if (generationRef.current !== gen) return;
+        // A failed load (e.g. unknown id) must not wipe the session on screen;
+        // the stage manager keeps the previous snapshot for comparison.
+        setError(reportError(err));
+      },
+    ).finally(() => {
+      loadInFlightRef.current -= 1;
+      if (loadInFlightRef.current === 0) setLoadBusy(false);
+    });
   }
 
   function transition(status: PerformanceStatus) {
@@ -121,7 +166,7 @@ export default function PerformanceConsole() {
     try {
       cue = parseInt32(cueText);
     } catch (err) {
-      reportError(err);
+      setError(reportError(err));
       return;
     }
     setCueText('');

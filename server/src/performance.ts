@@ -63,11 +63,11 @@ export type RejectReason =
   | 'NOT_RUNNING';
 
 // Legal status advance table. pending -> running, running <-> paused,
-// anything (except ended) -> ended. ended is terminal.
+// running/paused -> ended (no resume required to seal). ended is terminal.
 const LEGAL_TRANSITIONS: Record<PerformanceStatus, readonly PerformanceStatus[]> = {
   pending: ['running'],
   running: ['paused', 'ended'],
-  paused: ['running'],
+  paused: ['running', 'ended'],
   ended: [],
 };
 
@@ -159,16 +159,17 @@ export class PerformanceStore {
       );
     }
 
-    // Duplicate request ids are checked before the version so that an
-    // accidental resend is always reported as a no-op duplicate.
+    // Only *committed* request ids count as duplicates. A rejected command
+    // leaves the store untouched, so its request id is never recorded: the
+    // caller may correct the precondition (version/transition/run-state)
+    // and replay the very same request id without being falsely reported as
+    // a duplicate. Recording happens exclusively at the commit point below.
     if (this.committedRequests.has(command.requestId)) {
       reject(
         'DUPLICATE_REQUEST',
         `Request id "${command.requestId}" was already committed to session "${session.id}".`,
       );
     }
-
-    this.committedRequests.set(command.requestId, session.id);
 
     if (command.expectedVersion !== session.version) {
       reject(
